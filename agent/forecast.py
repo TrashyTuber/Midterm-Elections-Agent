@@ -166,6 +166,11 @@ def guard(question: dict, output: dict | None) -> tuple[dict[str, float], list[s
     ):
         return market, ["invalid or missing model output: used market prior"]
 
+    if output.get("confidence_in_deviation") == "none":
+        drift = max(abs(float(probs[n]) - market[n]) for n in names)
+        notes = [f"confidence 'none' but max drift {drift:.3f}: snapped to market"] if drift >= 5e-4 else []
+        return market, notes
+
     band = BAND.get(output.get("confidence_in_deviation"), DEFAULT_BAND)
     notes = []
     final = {}
@@ -193,6 +198,7 @@ async def forecast_event(
     brief: str | None = None,
     trace: list | None = None,
     force: bool = False,
+    research: dict | None = None,
 ) -> dict:
     """Forecast one event, apply the guard, save data/forecasts/<ticker>.json."""
     trace = list(trace or [])
@@ -228,6 +234,8 @@ async def forecast_event(
         "usage": res["usage"],
         "cached": res.get("cached", False),
         "cost_usd": 0.0 if res.get("cached") else cost_usd(res["model"], res["usage"]),
+        "research": research,
+        "brief": brief,
         "prices_at": question.get("prices_at"),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "trace": trace,

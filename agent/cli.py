@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 import json
 
-from . import fetch, forecast, submit
+from . import fetch, forecast, research, submit
 
 CONCURRENCY = 8
 SHIFT_EPS = 0.005  # shifts smaller than this count as "at market"
@@ -40,14 +40,23 @@ def select_questions(args: argparse.Namespace) -> list[dict]:
     return questions[: args.limit] if args.limit else questions
 
 
-async def _run(questions: list[dict], force: bool) -> list[dict]:
+async def _run(questions: list[dict], force: bool, no_search: bool) -> list[dict]:
     client = anthropic.AsyncAnthropic()
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async def one(q):
         async with sem:
-            rec = await forecast.forecast_event(client, q, brief=None, force=force)
+            res = None if no_search else await research.research_event(client, q, force=force)
+            rec = await forecast.forecast_event(
+                client, q,
+                brief=res["brief"] if res else None,
+                trace=res["trace"] if res else None,
+                force=force,
+                research={k: v for k, v in res.items() if k not in ("brief", "trace")} if res else None,
+            )
             status = "ERROR " + rec["error"] if rec["error"] else ("cached" if rec["cached"] else "ok")
+            if res and res["errors"]:
+                status += f" (research: {'; '.join(res['errors'])})"
             print(f"  {q['ticker']}: {status}")
             return rec
 
@@ -57,11 +66,21 @@ async def _run(questions: list[dict], force: bool) -> list[dict]:
 def cmd_run(args: argparse.Namespace) -> None:
     questions = select_questions(args)
     print(f"Forecasting {len(questions)} events with {forecast.forecast_model()}")
-    records = asyncio.run(_run(questions, args.force))
+    records = asyncio.run(_run(questions, args.force, args.no_search))
     inp = sum(r["usage"].get("input_tokens", 0) for r in records if not r["cached"])
     out = sum(r["usage"].get("output_tokens", 0) for r in records if not r["cached"])
     cost = sum(r["cost_usd"] for r in records)
-    print(f"Tokens (new calls): {inp:,} in / {out:,} out, est. cost ${cost:.4f}")
+    print(f"Forecast ({forecast.forecast_model()}, new calls): {inp:,} in / {out:,} out, ${cost:.4f}")
+    rs = [r["research"] for r in records if r.get("research")]
+    if rs:
+        rin = sum(x["usage"]["input_tokens"] for x in rs)
+        rout = sum(x["usage"]["output_tokens"] for x in rs)
+        rcost = sum(x["cost_usd"] for x in rs)
+        credits = sum(x["tavily_credits"] for x in rs)
+        print(f"Research ({research.cheap_model()}, new calls): {rin:,} in / {rout:,} out, ${rcost:.4f}; "
+              f"Tavily credits: {credits}")
+        cost += rcost
+    print(f"Total est. model cost this run: ${cost:.4f}")
     print_report(records)
 
 
@@ -139,10 +158,11 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("fetch", help="pull events to data/events.json").set_defaults(func=cmd_fetch)
 
-    run = sub.add_parser("run", help="forecast events (research added in step 5)")
+    run = sub.add_parser("run", help="research + forecast events")
     run.add_argument("--limit", type=int, help="first N open events")
     run.add_argument("--tickers", help="comma-separated tickers")
-    run.add_argument("--force", action="store_true", help="ignore cached model outputs")
+    run.add_argument("--force", action="store_true", help="ignore all caches (re-plan, re-search, re-forecast)")
+    run.add_argument("--no-search", action="store_true", help="skip research; forecast from market prices only")
     run.set_defaults(func=cmd_run)
 
     sub.add_parser("report", help="table of saved forecasts").set_defaults(func=cmd_report)

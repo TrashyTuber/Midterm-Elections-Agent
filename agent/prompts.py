@@ -47,3 +47,34 @@ PLANNER_PROMPT = """\
 Write 3 to 5 web search queries to find the most recent information relevant to
 forecasting: {title}. Prioritize polls from the last 2 weeks, early vote data,
 and late-breaking news. Return a JSON list of strings only."""
+
+# Appended to PLANNER_PROMPT so queries target this cycle, not 2024.
+PLANNER_CONTEXT = "Today is {today}. The election is on November 3, 2026."
+
+DIGEST_PROMPT = """\
+Today is {today}. You are preparing an evidence brief for a forecaster predicting
+this US election event on November 3, 2026.
+
+EVENT: {title}
+OUTCOMES: {outcomes}
+
+Below are web search results gathered today. Condense them into a brief of at most
+about 700 words that a forecaster can act on.
+
+Include, when present:
+- Polls: pollster, field dates, sample size/type (LV/RV), and the numbers. Note
+  partisan sponsors and low-quality or internal polls.
+- Early vote or turnout data, with dates.
+- Late-breaking news: scandals, withdrawals, endorsements, court rulings, ad spending,
+  debates, ballot or rule changes.
+- Expert ratings (Cook, Sabato, Inside Elections) and any recent rating changes.
+
+Rules:
+- Only state what the results say. Do not add outside knowledge or a forecast of your own.
+- Give each item its date and source URL. Put the most recent and most decision-relevant
+  items first.
+- Say clearly if the results are old, thin, off-topic, or about a different race or year.
+- Ignore prediction market prices; the forecaster already has them.
+
+SEARCH RESULTS:
+{results}"""
