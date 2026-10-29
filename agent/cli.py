@@ -2,6 +2,8 @@
 
 import argparse
 import asyncio
+import sys
+from datetime import datetime, timezone
 from collections import Counter
 
 import anthropic
@@ -37,7 +39,16 @@ def select_questions(args: argparse.Namespace) -> list[dict]:
         if missing:
             raise SystemExit(f"Unknown or non-open tickers: {', '.join(missing)}")
         return [by_ticker[t] for t in wanted]
+    if args.office:
+        questions = [q for q in questions if q["office"] == args.office]
+    if getattr(args, "competitive", False):
+        questions = [q for q in questions if is_competitive(q)]
     return questions[: args.limit] if args.limit else questions
+
+
+def is_competitive(q: dict) -> bool:
+    """Some outcome priced between 0.15 and 0.85: where research can plausibly matter."""
+    return any(0.15 <= v <= 0.85 for v in forecast.prior(q).values())
 
 
 async def _run(questions: list[dict], force: bool, no_search: bool) -> list[dict]:
@@ -77,8 +88,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         rout = sum(x["usage"]["output_tokens"] for x in rs)
         rcost = sum(x["cost_usd"] for x in rs)
         credits = sum(x["tavily_credits"] for x in rs)
+        web = sum(x.get("web_searches", 0) for x in rs)
         print(f"Research ({research.cheap_model()}, new calls): {rin:,} in / {rout:,} out, ${rcost:.4f}; "
-              f"Tavily credits: {credits}")
+              f"Tavily credits: {credits}; Claude web searches: {web}")
         cost += rcost
     print(f"Total est. model cost this run: ${cost:.4f}")
     print_report(records)
@@ -121,12 +133,11 @@ def print_report(records: list[dict]) -> None:
 
 
 def cmd_submit(args: argparse.Namespace) -> None:
-    if not args.dry_run:
-        raise SystemExit("Live submission is not enabled yet. Use --dry-run.")
     tickers = [t.strip() for t in args.tickers.split(",")] if args.tickers else None
     plan = submit.prepare(tickers)
 
-    print(f"DRY RUN: nothing will be sent. Now {plan['now']}, round 'early' closes {plan['closes_at']}.")
+    mode = "DRY RUN: nothing will be sent." if args.dry_run else "LIVE SUBMISSION."
+    print(f"{mode} Now {plan['now']}, round 'early' closes {plan['closes_at']}.")
     for ticker, info in plan["infos"].items():
         status = "INVALID" if ticker in plan["problems"] else "valid"
         extra = f", trace {info['trace_entries']} entries / {info['trace_raw_bytes']:,} B raw"
@@ -151,9 +162,86 @@ def cmd_submit(args: argparse.Namespace) -> None:
             print(f"\n--- trace_gzip_base64 decoded ---")
             print(json.dumps(submit.unpack_trace(item["trace_gzip_base64"]), indent=2))
 
+    if args.dry_run:
+        return
+    if plan["closes_at"] and datetime.now(timezone.utc) >= datetime.fromisoformat(plan["closes_at"]):
+        raise SystemExit("The deadline has passed; not sending.")
+    if not plan["items"]:
+        raise SystemExit("Nothing valid to send.")
+    if not args.yes:
+        answer = input(f"Send {len(plan['items'])} forecasts to Prophet Arena? Type SUBMIT to confirm: ")
+        if answer.strip() != "SUBMIT":
+            raise SystemExit("Not sent.")
+    try:
+        result = submit.send(plan)
+    except submit.SetupError as e:
+        raise SystemExit(f"STOP: {e}")
+    print(f"Accepted {len(result['accepted'])}, rejected {len(result['rejected'])}, "
+          f"receipts saved: {result['receipts']} (data/receipts/)")
+    for t, err in result["rejected"]:
+        print(f"  REJECTED {t}: {err}")
+    verify(plan["items"])
+
+
+def verify(sent: list[dict]) -> None:
+    try:
+        me = submit.fetch_me()
+    except submit.SetupError as e:
+        raise SystemExit(f"STOP: {e}")
+    problems = submit.compare_on_file(me, sent)
+    if not problems:
+        print(f"Verified: all {len(sent)} forecasts are on file with matching probabilities.")
+    else:
+        print(f"Verification found {len(problems)} issue(s) (raw response saved in data/receipts/):")
+        for p in problems[:20]:
+            print(f"  {p}")
+
+
+def cmd_me(args: argparse.Namespace) -> None:
+    try:
+        me = submit.fetch_me()
+    except submit.SetupError as e:
+        raise SystemExit(f"STOP: {e}")
+    on_file = submit.find_on_file(me)
+    print(f"/election/me: top-level keys {sorted(me) if isinstance(me, dict) else type(me).__name__}; "
+          f"{len(on_file)} forecasts found on file (raw response saved in data/receipts/).")
+    saved = {r["ticker"]: r["probabilities"] for r in forecast.load_forecasts()}
+    stale = [t for t, p in saved.items() if t in on_file and any(abs(on_file[t].get(k, -1) - v) > 1e-6 for k, v in p.items())]
+    print(f"Saved locally but not on file: {len(set(saved) - set(on_file))}; on file but differs from local: {len(stale)}")
+
+
+def cmd_rebase(args: argparse.Namespace) -> None:
+    """Refetch prices and re-anchor every saved forecast to them. No model or search calls."""
+    payload = fetch.fetch_events()
+    by_ticker = {q["ticker"]: q for q in payload["questions"]}
+    records = forecast.load_forecasts()
+    if args.tickers:
+        wanted = {t.strip() for t in args.tickers.split(",")}
+        records = [r for r in records if r["ticker"] in wanted]
+    updated, rows = [], []
+    for r in records:
+        q = by_ticker.get(r["ticker"])
+        new, note = forecast.rebase(r, q) if q else (None, "skipped: not in /election")
+        rows.append((r["ticker"], note))
+        if new:
+            updated.append(new)
+    moved = [(t, n) for t, n in rows if not n.startswith("rebased, max change 0.000")]
+    print(f"Prices as of {payload['questions'][0].get('prices_at') if payload['questions'] else '?'}: "
+          f"{len(updated)} rebased, {len(rows) - len(updated)} skipped.")
+    for t, n in moved:
+        print(f"  {t}: {n}")
+    if args.dry_run:
+        print("DRY RUN: forecasts and data/events.json not changed.")
+        return
+    fetch.save_events(payload)
+    for rec in updated:
+        forecast.save_forecast(rec)
+    print_report(updated)
+
 
 def main() -> None:
     load_dotenv()
+    sys.stdout.reconfigure(line_buffering=True)  # progress shows up live in log files
     parser = argparse.ArgumentParser(prog="agent.cli")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("fetch", help="pull events to data/events.json").set_defaults(func=cmd_fetch)
@@ -161,17 +249,27 @@ def main() -> None:
     run = sub.add_parser("run", help="research + forecast events")
     run.add_argument("--limit", type=int, help="first N open events")
     run.add_argument("--tickers", help="comma-separated tickers")
+    run.add_argument("--office", choices=["control", "senate", "governor", "house", "measure"], help="only this office type")
+    run.add_argument("--competitive", action="store_true", help="only events with an outcome priced 0.15-0.85")
     run.add_argument("--force", action="store_true", help="ignore all caches (re-plan, re-search, re-forecast)")
     run.add_argument("--no-search", action="store_true", help="skip research; forecast from market prices only")
     run.set_defaults(func=cmd_run)
 
     sub.add_parser("report", help="table of saved forecasts").set_defaults(func=cmd_report)
 
-    sm = sub.add_parser("submit", help="validate (and later send) saved forecasts")
+    sm = sub.add_parser("submit", help="validate and send saved forecasts (asks to confirm)")
     sm.add_argument("--dry-run", action="store_true", help="build and validate payloads without sending")
     sm.add_argument("--tickers", help="comma-separated tickers (default: all saved forecasts)")
     sm.add_argument("--show", metavar="TICKER", help="print one full payload with its trace decoded")
+    sm.add_argument("--yes", action="store_true", help="skip the SUBMIT confirmation prompt")
     sm.set_defaults(func=cmd_submit)
+
+    sub.add_parser("me", help="what is on file at Prophet Arena vs local forecasts").set_defaults(func=cmd_me)
+
+    rb = sub.add_parser("rebase", help="refetch prices and re-anchor saved forecasts (no model calls)")
+    rb.add_argument("--tickers", help="comma-separated tickers (default: all saved forecasts)")
+    rb.add_argument("--dry-run", action="store_true", help="show what would change without saving")
+    rb.set_defaults(func=cmd_rebase)
     args = parser.parse_args()
     args.func(args)
 

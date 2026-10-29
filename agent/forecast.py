@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,8 +22,9 @@ PRICING = {
     "claude-haiku-5-5": (0.10, 0.50),
 }
 
-BAND = {"strong": 0.20}  # any other confidence level gets the default band
-DEFAULT_BAND = 0.10
+# Max shift from market by stated confidence ("none" snaps to market in guard()).
+BAND = {"weak": 0.03, "strong": 0.10}
+DEFAULT_BAND = 0.03
 FLOOR, CEIL = 0.01, 0.99
 
 
@@ -243,6 +245,55 @@ async def forecast_event(
     FORECAST_DIR.mkdir(parents=True, exist_ok=True)
     (FORECAST_DIR / f"{question['ticker']}.json").write_text(json.dumps(record, indent=2))
     return record
+
+
+# ---------- rebase to fresh prices (no model calls) ----------
+
+def rebase(record: dict, question: dict) -> tuple[dict | None, str]:
+    """Re-anchor a saved forecast to the question's current market prices.
+
+    Keep our deviation d = ours - old market per outcome, measured from the new market.
+    If the market has since moved toward our view, treat that much of d as priced in:
+    d shrinks by the move and never flips sign. Returns (updated record or None, note).
+    """
+    if question.get("status") != "open":
+        return None, f"skipped: question status {question.get('status')}"
+    names = [o["name"] for o in question["outcomes"]]
+    if sorted(names) != sorted(record["probabilities"]):
+        return None, "skipped: outcome names changed; rerun this event"
+
+    old_mkt, ours, new_mkt = record["market"], record["probabilities"], prior(question)
+    new = {}
+    for n in names:
+        d, move = ours[n] - old_mkt[n], new_mkt[n] - old_mkt[n]
+        if d * move > 0:  # market moved our way
+            d = math.copysign(max(0.0, abs(d) - abs(move)), d)
+        new[n] = _clip(new_mkt[n] + d)
+    new = {k: round(v, 4) for k, v in new.items()} if is_independent(question) else _normalize(new)
+
+    rec = dict(record)
+    rec.setdefault("rationale_base", record["rationale"])
+    rec["rationale"] = rec["rationale_base"] + (
+        f" Probabilities re-anchored to market prices as of {question.get('prices_at')}, keeping the"
+        " evidence-based deviation (reduced by any market move in the same direction)."
+    )
+    if new != ours:
+        rec["trace"] = list(record.get("trace") or []) + [{"type": "guard", "before": ours, "after": new}]
+    rec.update(
+        market=new_mkt,
+        probabilities=new,
+        prices_at=question.get("prices_at"),
+        rebases=list(record.get("rebases") or []) + [{
+            "at": datetime.now(timezone.utc).isoformat(), "old_market": old_mkt, "before": ours, "after": new,
+        }],
+    )
+    max_change = max(abs(new[n] - ours[n]) for n in names)
+    return rec, f"rebased, max change {max_change:.3f}"
+
+
+def save_forecast(record: dict) -> None:
+    FORECAST_DIR.mkdir(parents=True, exist_ok=True)
+    (FORECAST_DIR / f"{record['ticker']}.json").write_text(json.dumps(record, indent=2))
 
 
 def load_forecasts() -> list[dict]:

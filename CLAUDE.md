@@ -118,7 +118,7 @@ fetch events -> for each event (5 to 10 concurrent):
 Rules:
 
 - **Market price is the prior.** `market_probs` = average of Kalshi and Polymarket for each outcome (fall back to whichever exists).
-- **The guard is enforced in code, never trusted to the model.** Clamp each outcome to within ±0.10 of market (±0.20 if the model reports `confidence_in_deviation == "strong"`), clamp to [0.01, 0.99], then renormalize to sum to 1. **Exception: ballot measures (`office == "measure"`), whether a lone `Yes` or a multi-measure "which will pass" question, are clamped per outcome but never renormalized.** Outcome names in the output must exactly match the event's outcome names. If the model output is missing or invalid, use the market prior.
+- **The guard is enforced in code, never trusted to the model.** If the model reports `confidence_in_deviation == "none"`, use the market prior exactly. Otherwise clamp each outcome to within ±0.03 of market for `"weak"` and ±0.10 for `"strong"`, clamp to [0.01, 0.99], then renormalize to sum to 1. **Exception: ballot measures (`office == "measure"`), whether a lone `Yes` or a multi-measure "which will pass" question, are clamped per outcome but never renormalized.** Outcome names in the output must exactly match the event's outcome names. If the model output is missing or invalid, use the market prior.
 - **Polymarket can be null.** When it is, use Kalshi alone as the prior.
 - **Research and submission are separate commands.** Never re-run searches just to resubmit.
 - **Cache everything.** Search results and model outputs are saved per event so a single event can be rerun without touching the others.
@@ -127,9 +127,10 @@ Rules:
 ## Stack
 
 - Python 3.11+, `httpx` (async), `anthropic` SDK, `python-dotenv`
-- Search: Tavily by default, behind a small `search(query) -> list[result]` interface so it can be swapped
-- Models (configurable via env): `CHEAP_MODEL` for plan and digest, `FORECAST_MODEL` for step 4
-- Env vars in `.env` (gitignored): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `ARENA_API_KEY`, `CHEAP_MODEL`, `FORECAST_MODEL`
+- Search (`SEARCH_BACKEND`): `tavily` (default) runs plan, search, digest, behind a small `search(query) -> list[result]` interface. `claude` uses Anthropic's server-side web search tool (`web_search_20250305` on the cheap model, $10 per 1,000 searches) to search and write the brief in one call. If every Tavily search for an event fails (for example, out of credits), that event falls back to `claude` unless `SEARCH_FALLBACK=0`. The free Tavily plan is 1,000 credits a month; `SEARCH_DEPTH=basic` costs 1 per query, `advanced` 2.
+- If the digest model refuses, the digest is retried with `FORECAST_MODEL`, then per query group, keeping the parts that succeed.
+- Models (configurable via env): `CHEAP_MODEL` for plan and digest, `FORECAST_MODEL` for step 4, `FORECAST_EFFORT` (default `high`)
+- Env vars in `.env` (gitignored): `ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `ARENA_API_KEY`, `CHEAP_MODEL`, `FORECAST_MODEL`, optional `FORECAST_EFFORT`, `SEARCH_BACKEND`, `SEARCH_DEPTH`, `SEARCH_FALLBACK`
 
 ## Layout
 
@@ -150,10 +151,26 @@ CLI:
 python -m agent.cli fetch
 python -m agent.cli run --limit 5          # research + forecast first N events
 python -m agent.cli run --tickers A,B      # specific events
+python -m agent.cli run --office senate    # one office type
+python -m agent.cli run --competitive      # only events with an outcome priced 0.15-0.85
+python -m agent.cli run --no-search        # market-anchored forecasts, no research
 python -m agent.cli report                 # table: ticker, market, ours, shift, confidence
+python -m agent.cli rebase [--dry-run]     # refetch prices, re-anchor saved forecasts (no model calls)
 python -m agent.cli submit --dry-run       # validate payloads without sending
-python -m agent.cli submit
+python -m agent.cli submit                 # send; asks to type SUBMIT (--yes skips), then checks /me
+python -m agent.cli me                     # what is on file vs local forecasts
 ```
+
+`rebase` keeps each saved deviation from market, measured from the new price. If the market has moved toward our view, the deviation shrinks by that move (never flips sign), on the theory that the evidence is now priced in.
+
+## Deadline runbook (Mon Nov 2, deadline 5:00 PM ET = 22:00 UTC)
+
+Scored against market prices at the deadline, so stale anchors cost more than research earns.
+
+1. Before Monday: run all events, review, `submit` once as insurance (resubmitting replaces).
+2. Monday morning: `fetch`, then `run --competitive` (fresh research on races where it can matter; about 58 events). Review `report`, then `submit`.
+3. Monday about 3:30 PM ET: `rebase`, `submit --dry-run`, `submit`, then `me`. Leave at least an hour of buffer; the server clock decides.
+4. If anything breaks late: `fetch` then `run --no-search` puts market-anchored forecasts on file in minutes.
 
 ## Forecasting prompt (step 4)
 
@@ -179,6 +196,9 @@ Rules:
 - Every shift must be tied to a specific item in the brief. General partisan lean
   does not count; the market already knows that.
 - Be skeptical of single polls, especially partisan or low-quality ones.
+- If the evidence is something the market has likely already seen and priced in
+  (for example, a widely reported poll or rating change), or you think it may be,
+  return the market average.
 - Never put any outcome above 0.99 or below 0.01.
 
 Respond with JSON only:

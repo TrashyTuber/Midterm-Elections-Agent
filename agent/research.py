@@ -1,4 +1,11 @@
-"""Steps 1-3 per event: plan queries, run searches, digest results into an evidence brief."""
+"""Steps 1-3 per event: plan queries, run searches, digest results into an evidence brief.
+
+Two search backends (SEARCH_BACKEND):
+  tavily  plan -> Tavily search -> digest (default). Falls back to claude for an event
+          if every Tavily search fails (e.g. out of credits), unless SEARCH_FALLBACK=0.
+  claude  one cheap-model call with Anthropic's server-side web search tool that
+          searches and writes the brief with citations.
+"""
 
 import asyncio
 import hashlib
@@ -12,17 +19,24 @@ from tavily import AsyncTavilyClient
 
 from . import prompts
 from .fetch import DATA_DIR
-from .forecast import cost_usd
+from .forecast import cost_usd, forecast_model
 
 CACHE_DIR = DATA_DIR / "cache"
 MAX_QUERIES = 5
 RESULTS_PER_QUERY = 5
 SNIPPET_CHARS = 1500  # per result, in the digest prompt
 TAVILY_CREDITS = {"basic": 1, "advanced": 2}
+WEB_SEARCH_USD = 0.01  # Anthropic web search: $10 per 1,000 searches
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": MAX_QUERIES}
+MAX_CONTINUATIONS = 3
 
 
 def cheap_model() -> str:
     return os.environ.get("CHEAP_MODEL", "claude-haiku-5-5")
+
+
+def search_backend() -> str:
+    return os.environ.get("SEARCH_BACKEND", "tavily")
 
 
 def _key(*parts: str) -> str:
@@ -40,6 +54,25 @@ def _write(path, obj):
 
 def _outcomes(question: dict) -> str:
     return ", ".join(f"{o['name']} ({o['party']})" if o.get("party") else o["name"] for o in question["outcomes"])
+
+
+class Tally:
+    """Token, dollar and search-credit accounting for one event's research."""
+
+    def __init__(self):
+        self.usage = {"input_tokens": 0, "output_tokens": 0}
+        self.cost = 0.0
+        self.tavily_credits = 0
+        self.web_searches = 0
+
+    def add(self, model: str, usage: dict):
+        self.usage["input_tokens"] += usage.get("input_tokens", 0)
+        self.usage["output_tokens"] += usage.get("output_tokens", 0)
+        self.cost += cost_usd(model, usage)
+
+    def add_web_searches(self, n: int):
+        self.web_searches += n
+        self.cost += n * WEB_SEARCH_USD
 
 
 # ---------- search interface (swappable) ----------
@@ -65,10 +98,9 @@ async def search(query: str) -> list[dict]:
     ]
 
 
-# ---------- cheap model helper ----------
+# ---------- model helper ----------
 
-async def _cheap_call(client: anthropic.AsyncAnthropic, prompt: str, effort: str) -> tuple[str, dict, str | None]:
-    model = cheap_model()
+async def _call(client: anthropic.AsyncAnthropic, model: str, prompt: str, effort: str) -> tuple[str, dict, str | None]:
     try:
         resp = await client.messages.create(
             model=model,
@@ -95,30 +127,28 @@ def _parse_queries(text: str) -> list[str]:
     return [q.strip() for q in data if isinstance(q, str) and q.strip()][:MAX_QUERIES]
 
 
-# ---------- per-event pipeline ----------
+def _result(brief, trace, tally, errors, queries, backend):
+    return {"brief": brief, "trace": trace, "usage": tally.usage, "model": cheap_model(),
+            "cost_usd": tally.cost, "tavily_credits": tally.tavily_credits,
+            "web_searches": tally.web_searches, "backend": backend,
+            "errors": errors, "queries": queries}
 
-async def research_event(client: anthropic.AsyncAnthropic, question: dict, force: bool = False) -> dict:
-    """Return {"brief", "trace", "usage": {model: {...}}, "cost_usd", "tavily_credits", "errors"}."""
-    ticker = question["ticker"]
-    cdir = CACHE_DIR / ticker
+
+# ---------- tavily backend: plan -> search -> digest ----------
+
+async def _research_tavily(client, question: dict, force: bool) -> dict:
+    cdir = CACHE_DIR / question["ticker"]
     today = date.today().isoformat()
     model = cheap_model()
-    usage = {"input_tokens": 0, "output_tokens": 0}
-    cost, credits, errors, trace = 0.0, 0, [], []
-
-    def add_usage(u):
-        nonlocal cost
-        usage["input_tokens"] += u.get("input_tokens", 0)
-        usage["output_tokens"] += u.get("output_tokens", 0)
-        cost += cost_usd(model, u)
+    tally, errors, trace = Tally(), [], []
 
     # 1. plan
     plan_prompt = prompts.PLANNER_PROMPT.format(title=question["title"]) + "\n" + prompts.PLANNER_CONTEXT.format(today=today)
     plan_path = cdir / f"plan-{_key(model, plan_prompt)}.json"
     plan = None if force else _read(plan_path)
     if plan is None:
-        text, u, err = await _cheap_call(client, plan_prompt, effort="low")
-        add_usage(u)
+        text, u, err = await _call(client, model, plan_prompt, effort="low")
+        tally.add(model, u)
         queries = _parse_queries(text)
         if err or not queries:
             errors.append(f"plan: {err or 'unparseable output'}; using fallback queries")
@@ -143,7 +173,7 @@ async def research_event(client: anthropic.AsyncAnthropic, question: dict, force
     searched = await asyncio.gather(*(run_query(q) for q in plan["queries"]))
     seen, kept = set(), []
     for q, hit, c in searched:
-        credits += c
+        tally.tavily_credits += c
         if hit.get("error"):
             errors.append(f"search {q!r}: {hit['error']}")
         trace.append({
@@ -160,28 +190,130 @@ async def research_event(client: anthropic.AsyncAnthropic, question: dict, force
     # 3. digest
     if not kept:
         errors.append("no search results; no brief")
-        return {"brief": None, "trace": trace, "usage": usage, "model": model,
-                "cost_usd": cost, "tavily_credits": credits, "errors": errors, "queries": plan["queries"]}
+        res = _result(None, trace, tally, errors, plan["queries"], "tavily")
+        res["all_searches_failed"] = all(hit.get("error") for _, hit, _ in searched)
+        return res
 
-    results_text = "\n\n".join(
-        f"[{i}] {r['title']}\nURL: {r['url']}\nPublished: {r.get('published_date') or 'unknown'}\n{r['content'][:SNIPPET_CHARS]}"
-        for i, r in enumerate(kept, 1)
-    )
-    digest_prompt = prompts.DIGEST_PROMPT.format(today=today, title=question["title"],
-                                                 outcomes=_outcomes(question), results=results_text)
-    digest_path = cdir / f"digest-{_key(model, digest_prompt)}.json"
+    def digest_prompt(results: list[dict]) -> str:
+        text = "\n\n".join(
+            f"[{i}] {r['title']}\nURL: {r['url']}\nPublished: {r.get('published_date') or 'unknown'}\n{r['content'][:SNIPPET_CHARS]}"
+            for i, r in enumerate(results, 1)
+        )
+        return prompts.DIGEST_PROMPT.format(today=today, title=question["title"], outcomes=_outcomes(question), results=text)
+
+    full_prompt = digest_prompt(kept)
+    digest_path = cdir / f"digest-{_key(model, full_prompt)}.json"
     digest = None if force else _read(digest_path)
     if digest is None:
-        text, u, err = await _cheap_call(client, digest_prompt, effort="medium")
-        add_usage(u)
-        if err or not text.strip():
-            errors.append(f"digest: {err or 'empty output'}")
-            digest = {"brief": None}
-        else:
-            digest = {"brief": text.strip()}
+        digest = {"brief": None}
+        # Cheap model first; if it refuses or fails, retry once with the forecast model.
+        for m in dict.fromkeys([model, forecast_model()]):
+            text, u, err = await _call(client, m, full_prompt, effort="medium")
+            tally.add(m, u)
+            if not err and text.strip():
+                digest = {"brief": text.strip(), "model": m}
+                break
+            errors.append(f"digest ({m}): {err or 'empty output'}")
+        if digest["brief"] is None:
+            # Something in the results trips a refusal. Digest each query's results on its
+            # own and keep the parts that succeed, so one bad result only costs its group.
+            groups = [(q, [r for r in hit.get("results", [])]) for q, hit, _ in searched if hit.get("results")]
+            parts = await asyncio.gather(*(_call(client, model, digest_prompt(rs), effort="medium") for _, rs in groups))
+            kept_parts = []
+            for (q, _), (text, u, err) in zip(groups, parts):
+                tally.add(model, u)
+                if not err and text.strip():
+                    kept_parts.append(f"### Results for: {q}\n\n{text.strip()}")
+                else:
+                    errors.append(f"digest part {q!r}: {err or 'empty output'}")
+            if kept_parts:
+                digest = {"brief": "\n\n".join(kept_parts), "model": model, "split": True}
+        if digest["brief"]:
             _write(digest_path, digest)
     if digest["brief"]:
         trace.append({"type": "brief", "text": digest["brief"]})
+    return _result(digest["brief"], trace, tally, errors, plan["queries"], "tavily")
 
-    return {"brief": digest["brief"], "trace": trace, "usage": usage, "model": model,
-            "cost_usd": cost, "tavily_credits": credits, "errors": errors, "queries": plan["queries"]}
+
+# ---------- claude backend: server-side web search + brief in one call ----------
+
+def _claude_trace(content: list) -> tuple[list, str]:
+    """Turn response blocks into step-log entries and the brief text. Only what came back."""
+    blocks = [b.model_dump() for b in content]
+    results = {b["tool_use_id"]: b["content"] for b in blocks if b["type"] == "web_search_tool_result"}
+    cited = {}
+    for b in blocks:
+        if b["type"] == "text":
+            for c in b.get("citations") or []:
+                if c.get("url"):
+                    cited.setdefault(c["url"], []).append(c.get("cited_text", ""))
+
+    trace = []
+    for b in blocks:
+        if b["type"] == "server_tool_use" and b.get("name") == "web_search":
+            res = results.get(b["id"])
+            if isinstance(res, list):
+                payload = [{"title": r.get("title"), "url": r.get("url"), "page_age": r.get("page_age"),
+                            "cited_text": cited.get(r.get("url"), [])} for r in res]
+                result = json.dumps(payload, ensure_ascii=False)
+            else:
+                result = f"error: {(res or {}).get('error_code', 'no result')}"
+            trace.append({"type": "tool_call", "tool": "web_search", "args": {"query": b["input"].get("query")}, "result": result})
+    brief = "".join(b["text"] for b in blocks if b["type"] == "text").strip()
+    return trace, brief
+
+
+async def _research_claude(client, question: dict, force: bool) -> dict:
+    cdir = CACHE_DIR / question["ticker"]
+    today = date.today().isoformat()
+    model = cheap_model()
+    tally, errors = Tally(), []
+    prompt = prompts.CLAUDE_RESEARCH_PROMPT.format(today=today, title=question["title"], outcomes=_outcomes(question))
+    path = cdir / f"claude-research-{_key(model, prompt)}.json"
+    cached = None if force else _read(path)
+    if cached is not None:
+        return _result(cached["brief"], cached["trace"], tally, errors, cached["queries"], "claude")
+
+    messages = [{"role": "user", "content": prompt}]
+    content = []
+    try:
+        for _ in range(MAX_CONTINUATIONS + 1):
+            resp = await client.messages.create(
+                model=model, max_tokens=16000, output_config={"effort": "medium"},
+                tools=[WEB_SEARCH_TOOL], messages=messages,
+            )
+            tally.add(model, {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens})
+            stu = getattr(resp.usage, "server_tool_use", None)
+            tally.add_web_searches(getattr(stu, "web_search_requests", 0) or 0)
+            content += resp.content
+            if resp.stop_reason != "pause_turn":
+                break
+            messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": content}]
+        if resp.stop_reason in ("refusal", "max_tokens"):
+            errors.append(f"claude research: {resp.stop_reason}")
+    except anthropic.APIError as e:
+        errors.append(f"claude research: {type(e).__name__}: {e}")
+
+    trace, brief = _claude_trace(content)
+    queries = [e["args"]["query"] for e in trace]
+    if brief:
+        trace.append({"type": "brief", "text": brief})
+        _write(path, {"brief": brief, "trace": trace, "queries": queries})
+    else:
+        errors.append("claude research: no brief")
+    return _result(brief or None, trace, tally, errors, queries, "claude")
+
+
+# ---------- entry point ----------
+
+async def research_event(client: anthropic.AsyncAnthropic, question: dict, force: bool = False) -> dict:
+    """Return {"brief", "trace", "usage", "cost_usd", "tavily_credits", "web_searches", "backend", "errors", "queries"}."""
+    if search_backend() == "claude":
+        return await _research_claude(client, question, force)
+    res = await _research_tavily(client, question, force)
+    if res.pop("all_searches_failed", False) and os.environ.get("SEARCH_FALLBACK", "1") != "0":
+        fb = await _research_claude(client, question, force)
+        fb["errors"] = res["errors"] + ["tavily failed; used claude web search"] + fb["errors"]
+        fb["cost_usd"] += res["cost_usd"]
+        return fb
+    return res

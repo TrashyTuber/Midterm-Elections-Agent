@@ -23,6 +23,9 @@ Rules:
 - Every shift must be tied to a specific item in the brief. General partisan lean
   does not count; the market already knows that.
 - Be skeptical of single polls, especially partisan or low-quality ones.
+- If the evidence is something the market has likely already seen and priced in
+  (for example, a widely reported poll or rating change), or you think it may be,
+  return the market average.
 - Never put any outcome above 0.99 or below 0.01.
 
 Respond with JSON only:
@@ -78,3 +81,29 @@ Rules:
 
 SEARCH RESULTS:
 {results}"""
+
+# SEARCH_BACKEND=claude: one call that searches with the web search tool and writes the brief.
+CLAUDE_RESEARCH_PROMPT = """\
+Today is {today}. You are preparing an evidence brief for a forecaster predicting
+this US election event on November 3, 2026.
+
+EVENT: {title}
+OUTCOMES: {outcomes}
+
+Use the web search tool 3 to 5 times to find the most recent information. Prioritize
+polls from the last 2 weeks, early vote data, and late-breaking news. Then write a
+brief of at most about 700 words that a forecaster can act on.
+
+Include, when present:
+- Polls: pollster, field dates, sample size/type (LV/RV), and the numbers. Note
+  partisan sponsors and low-quality or internal polls.
+- Early vote or turnout data, with dates.
+- Late-breaking news: scandals, withdrawals, endorsements, court rulings, ad spending,
+  debates, ballot or rule changes.
+- Expert ratings (Cook, Sabato, Inside Elections) and any recent rating changes.
+
+Rules:
+- Only state what the search results say. Do not add outside knowledge or a forecast of your own.
+- Give each item its date and source. Put the most recent and most decision-relevant items first.
+- Say clearly if the results are old, thin, off-topic, or about a different race or year.
+- Ignore prediction market prices; the forecaster already has them."""
