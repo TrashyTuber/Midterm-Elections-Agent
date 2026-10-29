@@ -96,7 +96,7 @@ Errors: `validation_failed` (422, fix and retry), `window_closed` (422, deadline
 
 ### GET /election/me (auth)
 
-The user's own record: what is on file with receipts, and after settlement, Brier per event vs the markets plus Arena score and rank. Use it to verify submissions landed.
+The user's own record: what is on file with receipts, and after settlement, Brier per event vs the markets plus Arena score and rank. Use it to verify submissions landed. Observed before settlement (Oct 29): it returns only `agent`, `entry` {name, status} and `rounds` [{key, answered, scored, brier, ...}], with no per-forecast values, so verification is by `answered` count.
 
 ### GET /election/questions/{ticker}
 

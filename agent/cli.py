@@ -188,6 +188,12 @@ def verify(sent: list[dict]) -> None:
         me = submit.fetch_me()
     except submit.SetupError as e:
         raise SystemExit(f"STOP: {e}")
+    if not submit.find_on_file(me):
+        # /election/me reports per-round counts, not per-forecast values.
+        answered = {r["key"]: r.get("answered") for r in me.get("rounds", [])}
+        print(f"/election/me answered per round: {answered} (sent {len(sent)} this time; "
+              "the endpoint does not return values, so they cannot be compared one by one).")
+        return
     problems = submit.compare_on_file(me, sent)
     if not problems:
         print(f"Verified: all {len(sent)} forecasts are on file with matching probabilities.")
@@ -197,14 +203,29 @@ def verify(sent: list[dict]) -> None:
             print(f"  {p}")
 
 
+def cmd_export(args: argparse.Namespace) -> None:
+    """Write the upload-panel JSON file from the same validated payloads `submit` would send."""
+    plan = submit.prepare([t.strip() for t in args.tickers.split(",")] if args.tickers else None)
+    for t, errs in plan["problems"].items():
+        print(f"  SKIPPED {t}: {'; '.join(errs)}")
+    path = submit.export_upload(plan)
+    print(f"Wrote {len(plan['items'])} forecasts to {path} ({path.stat().st_size / 1e6:.1f} MB). "
+          f"Prices as of the last fetch/rebase; nothing was sent.")
+
+
 def cmd_me(args: argparse.Namespace) -> None:
     try:
         me = submit.fetch_me()
     except submit.SetupError as e:
         raise SystemExit(f"STOP: {e}")
     on_file = submit.find_on_file(me)
-    print(f"/election/me: top-level keys {sorted(me) if isinstance(me, dict) else type(me).__name__}; "
-          f"{len(on_file)} forecasts found on file (raw response saved in data/receipts/).")
+    print(f"Entry: {me.get('entry', {}).get('name')} ({me.get('entry', {}).get('status')})")
+    for r in me.get("rounds", []):
+        print(f"  round {r.get('key')}: answered {r.get('answered')}, scored {r.get('scored')}, "
+              f"brier {r.get('brier')}, closes {r.get('closes_at')}")
+    print(f"Saved locally: {len(forecast.load_forecasts())} forecasts. Raw response saved in data/receipts/.")
+    if not on_file:
+        return  # per-forecast values are not part of this response
     saved = {r["ticker"]: r["probabilities"] for r in forecast.load_forecasts()}
     stale = [t for t, p in saved.items() if t in on_file and any(abs(on_file[t].get(k, -1) - v) > 1e-6 for k, v in p.items())]
     print(f"Saved locally but not on file: {len(set(saved) - set(on_file))}; on file but differs from local: {len(stale)}")
@@ -265,6 +286,10 @@ def main() -> None:
     sm.set_defaults(func=cmd_submit)
 
     sub.add_parser("me", help="what is on file at Prophet Arena vs local forecasts").set_defaults(func=cmd_me)
+
+    ex = sub.add_parser("export", help="write a JSON file for the website's Upload JSON panel")
+    ex.add_argument("--tickers", help="comma-separated tickers (default: all saved forecasts)")
+    ex.set_defaults(func=cmd_export)
 
     rb = sub.add_parser("rebase", help="refetch prices and re-anchor saved forecasts (no model calls)")
     rb.add_argument("--tickers", help="comma-separated tickers (default: all saved forecasts)")

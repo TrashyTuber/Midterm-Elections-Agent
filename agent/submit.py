@@ -364,3 +364,21 @@ def compare_on_file(me: dict, sent: list[dict]) -> list[str]:
         elif any(abs(got.get(k, -1) - v) > 1e-6 for k, v in it["probabilities"].items()):
             problems.append(f"{it['question']}: on file {got} != sent {it['probabilities']}")
     return problems
+
+
+# ---------- file for the website's "Upload JSON" panel ----------
+
+def export_upload(plan: dict) -> Path:
+    """Write the validated, sanitized items in the upload-panel format: [{ticker, probabilities, rationale, trace}]."""
+    rows = []
+    for it in plan["items"]:
+        row = {"ticker": it["question"], "probabilities": it["probabilities"], "rationale": it["rationale"]}
+        if "trace_gzip_base64" in it:
+            row["trace"] = unpack_trace(it["trace_gzip_base64"])
+        rows.append(row)
+    out_dir = DATA_DIR / "upload"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = out_dir / f"forecasts-{stamp}.json"
+    path.write_text(json.dumps(rows, indent=1, ensure_ascii=False))
+    return path
